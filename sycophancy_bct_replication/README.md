@@ -47,24 +47,42 @@ export OPENROUTER_API_KEY=sk-or-...
 ## 1. Run the experiment
 
 ```bash
-OPENROUTER_MODEL=anthropic/claude-sonnet-5 python run_experiment.py
+python run_experiment.py
 ```
 
-Sends both the unbiased and biased prompt for all 60 questions (120 calls
-total) and saves raw responses to `results_raw_<model>.json` as it goes —
-safe to Ctrl-C, re-running skips (question, condition) pairs you already
-have. Run it again with a different model and it writes to a separate file
-without touching the first one — e.g. to also sanity-check against the
-exact model the paper used:
+With no model specified, this sweeps a default list of 5 models one after
+another (see `DEFAULT_MODELS` at the top of `run_experiment.py`):
+
+- `openai/gpt-3.5-turbo` — the exact model the paper used (sanity check)
+- `anthropic/claude-sonnet-5`
+- `anthropic/claude-opus-4.8`
+- `anthropic/claude-haiku-4.5`
+- `google/gemini-2.5-pro`
+
+For each model it sends both the unbiased and biased prompt for all 60
+questions (120 calls) and saves raw responses to a separate
+`results_raw_<model>.json` — so one model's run never overwrites another's.
+It's safe to Ctrl-C at any point: re-running skips every model/question/
+condition triple you already have, whether that's because it crashed,
+you stopped it, or you're adding one more model later.
+
+To run only specific models instead of the default sweep:
 
 ```bash
-OPENROUTER_MODEL=openai/gpt-3.5-turbo python run_experiment.py
+OPENROUTER_MODEL=anthropic/claude-sonnet-5 python run_experiment.py          # just one
+OPENROUTER_MODELS=anthropic/claude-sonnet-5,google/gemini-2.5-pro python run_experiment.py  # a custom list
 ```
 
-(Model slugs on OpenRouter are `{provider}/{name}` — check
-[openrouter.ai/models](https://openrouter.ai/models) if a slug 404s; GPT-3.5-Turbo
-is on OpenAI's own deprecation path for October 2026, so it may eventually
-disappear.)
+Two things worth knowing before you kick off the full sweep:
+- **Cost/time**: 5 models × 120 calls = 600 calls total. Opus in particular
+  is the most expensive model in the list — if you want a cheaper first
+  pass, drop it via `OPENROUTER_MODELS` and add it back later.
+- **Model slugs move fast.** These are pinned to specific versions (not
+  `-latest` aliases) so the experiment stays reproducible, but double-check
+  each one still resolves at [openrouter.ai/models](https://openrouter.ai/models)
+  before a real run — if one 404s, `run_experiment.py` will print that and
+  skip just that model rather than crash the whole sweep. GPT-3.5-Turbo
+  specifically is on OpenAI's own deprecation path for October 2026.
 
 ## 2. Grade and chart
 

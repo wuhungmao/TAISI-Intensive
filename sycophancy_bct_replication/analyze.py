@@ -36,11 +36,11 @@ PAPER_BASELINE = {
     "accuracy_biased": 48.0,
 }
 
-# Fixed categorical slots (dataviz skill palette). Paper reference always
-# gets slot 2 (orange); live model runs take the remaining slots in the
-# order their results files are discovered, so colors never get reassigned
-# out of order as you add/remove a model.
-MODEL_COLOR_SLOTS = ["#2a78d6", "#1baf7a", "#eda100", "#4a3aa7", "#e34948"]
+# Fixed categorical slots (dataviz skill palette, skipping slot 2/orange --
+# that's reserved for the paper reference series below). Live model runs
+# take these in the order their results files are discovered, so colors
+# never get reassigned out of order as you add/remove a model.
+MODEL_COLOR_SLOTS = ["#2a78d6", "#1baf7a", "#eda100", "#e87ba4", "#008300", "#4a3aa7", "#e34948"]
 PAPER_COLOR = "#eb6834"
 
 
@@ -133,11 +133,17 @@ def main():
     series.append((PAPER_BASELINE["label"], None, PAPER_COLOR))  # paper handled specially below
 
     n_series = len(series)
-    fig, axes = plt.subplots(1, 2, figsize=(11.5, 4.6))
+    # Wider figure and smaller bar width as more models get added, so bars
+    # don't get crushed; skip on-bar value labels past 4 series -- with 6+
+    # bars per group the numbers just overlap and stop being readable (the
+    # printed tables above have the exact figures).
+    fig_width = max(11.5, 2.2 * n_series)
+    show_labels = n_series <= 4
+    fig, axes = plt.subplots(1, 2, figsize=(fig_width, 4.8))
     conditions = ["unbiased", "biased"]
     cond_labels = ["Unbiased\nprompt", "Biased prompt\n(stated wrong belief)"]
     x = list(range(len(conditions)))
-    width = min(0.8 / n_series, 0.3)
+    width = min(0.85 / n_series, 0.3)
 
     metrics = [
         ("biasing_rate", "biasing_rate_unbiased", "biasing_rate_biased",
@@ -146,6 +152,7 @@ def main():
          "Task accuracy", axes[1]),
     ]
 
+    legend_handles = []
     for key, paper_unbiased_key, paper_biased_key, title, ax in metrics:
         for i, (label, summary, color) in enumerate(series):
             offset = (i - (n_series - 1) / 2) * width
@@ -154,10 +161,13 @@ def main():
             else:
                 vals = [summary[c][key] for c in conditions]
             bars = ax.bar([xi + offset for xi in x], vals, width, label=label, color=color, zorder=3)
-            for b in bars:
-                h = b.get_height()
-                ax.text(b.get_x() + b.get_width() / 2, h + 1.5, f"{h:.0f}%",
-                        ha="center", va="bottom", fontsize=8, color="#0b0b0b")
+            if ax is axes[0]:
+                legend_handles.append(bars)
+            if show_labels:
+                for b in bars:
+                    h = b.get_height()
+                    ax.text(b.get_x() + b.get_width() / 2, h + 1.5, f"{h:.0f}%",
+                            ha="center", va="bottom", fontsize=8, color="#0b0b0b")
 
         ax.set_xticks(x)
         ax.set_xticklabels(cond_labels, fontsize=9)
@@ -168,14 +178,19 @@ def main():
         ax.yaxis.grid(True, color="#e5e5e0", linewidth=0.8, zorder=0)
         ax.set_axisbelow(True)
 
-    axes[0].legend(loc="upper left", fontsize=7.5, frameon=False)
-    fig.tight_layout(rect=[0, 0, 1, 0.88])
+    # Shared legend below both panels -- keeps it readable regardless of
+    # how many models are in the comparison.
+    labels = [s[0] for s in series]
+    ncol = min(n_series, 4)
+    fig.legend(legend_handles, labels, loc="lower center", ncol=ncol, fontsize=8,
+               frameon=False, bbox_to_anchor=(0.5, -0.02))
+    fig.tight_layout(rect=[0, 0.08 + 0.04 * ((n_series - 1) // 4), 1, 0.88])
     fig.suptitle(
         "Replicating BCT's suggested-answer bias (Wei et al. 2024)\n"
         f"n = {len(questions)} questions from MMLU / TruthfulQA / LogiQA / HellaSwag",
         fontsize=11, y=0.99,
     )
-    fig.savefig(CHART_PATH, dpi=200)
+    fig.savefig(CHART_PATH, dpi=200, bbox_inches="tight")
     print(f"Chart saved to {CHART_PATH}")
 
 
