@@ -17,12 +17,19 @@ each. Prompts and ground truth come straight from the paper's own released
 dataset (github.com/raybears/cot-transparency, MIT licensed) -- see
 sampled_questions.json.
 
+Calls within a single model's batch run CONCURRENTLY (a thread pool, since
+these are I/O-bound network calls) -- by default 8 at once, tune with
+CONCURRENCY. Models themselves are still run one after another, so
+per-model progress stays easy to read and each model's results file stays
+independent.
+
 Results are written to a PER-MODEL file (results_raw_<model>.json), so
 running multiple models never clobbers a previous one -- analyze.py picks
 up every results_raw_*.json file it finds automatically. Raw responses are
-appended as they come in, so Ctrl-C is always safe: re-running resumes
-(skips model/question/condition triples you already have), whether that's
-because it crashed, you stopped it, or you're adding one more model later.
+written to disk as they come in, so Ctrl-C is always safe: re-running
+resumes (skips model/question/condition triples you already have), whether
+that's because it crashed, you stopped it, or you're adding one more model
+later.
 
 Usage:
     export OPENROUTER_API_KEY=sk-or-...
@@ -35,11 +42,17 @@ Usage:
 
     # Or a custom list:
     OPENROUTER_MODELS=anthropic/claude-sonnet-5,google/gemini-2.5-pro python run_experiment.py
+
+    # Tune concurrency (default 8; lower this if you start seeing a lot of
+    # rate-limit retries in the output):
+    CONCURRENCY=4 python run_experiment.py
 """
 
+import concurrent.futures
 import json
 import os
 import re
+import threading
 import time
 from pathlib import Path
 
@@ -60,13 +73,35 @@ DEFAULT_MODELS = [
 ]
 
 QUESTIONS_PATH = Path("sampled_questions.json")
-MAX_TOKENS = 800  # these prompts elicit step-by-step CoT, so allow room for it
+MAX_TOKENS = 1500  # room for a full visible step-by-step CoT plus the final answer line
 TEMPERATURE = 0
 CONDITIONS = ["unbiased", "biased"]
+CONCURRENCY = int(os.environ.get("CONCURRENCY", "8"))
+
+# Some models (Gemini 2.5 Pro, Claude with extended thinking, etc.) spend part
+# of max_tokens on a HIDDEN reasoning pass before writing any visible text --
+# with a low max_tokens that hidden pass can eat the whole budget, cutting the
+# response off before it ever reaches "the best answer is: (X)". We want the
+# step-by-step reasoning to happen in the VISIBLE completion anyway (the
+# dataset's own prompt already asks for that explicitly, and that's what
+# faithfully matches the paper's original GPT-3.5-Turbo methodology, which
+# had no separate hidden-thinking channel to begin with). This OpenRouter
+# extension turns hidden reasoning off; it's a no-op for models that don't
+# support it, so it's safe to send on every call. See:
+# https://openrouter.ai/docs/use-cases/reasoning-tokens
+REASONING_EXTRA_BODY = {"reasoning": {"effort": "none"}}
 
 # Matches the exact format the dataset's own prompts ask for:
 # 'Therefore, the best answer is: (X).'
 FINAL_ANSWER_RE = re.compile(r"best answer is:?\s*\(?([A-Za-z])\)?", re.IGNORECASE)
+
+
+class FatalAuthError(Exception):
+    """The API key itself was rejected -- no point retrying anything."""
+
+
+class ModelNotFoundError(Exception):
+    """OpenRouter doesn't recognize this model slug -- skip the rest of this model."""
 
 
 def model_slug(model):
@@ -93,25 +128,17 @@ def call_model(client, model, user_prompt, retries=4):
                 max_tokens=MAX_TOKENS,
                 temperature=TEMPERATURE,
                 messages=[{"role": "user", "content": user_prompt}],
+                extra_body=REASONING_EXTRA_BODY,
             )
-            return resp.choices[0].message.content
+            content = resp.choices[0].message.content
+            return content or ""
         except openai.AuthenticationError as e:
-            # Permanent failure -- retrying won't help, fail fast with a clear message.
-            raise SystemExit(
-                f"OpenRouter rejected the API key (401 authentication error): {e}\n"
-                f"Double-check OPENROUTER_API_KEY is set to a valid OpenRouter key (starts with "
-                f"'sk-or-'), not a key from another provider."
-            )
+            raise FatalAuthError(str(e))
         except openai.NotFoundError as e:
-            print(
-                f"    Model '{model}' not found on OpenRouter (404) -- skipping it. "
-                f"Check the exact slug at https://openrouter.ai/models."
-            )
-            return None
+            raise ModelNotFoundError(str(e))
         except (openai.APIConnectionError, openai.RateLimitError, openai.InternalServerError, openai.APITimeoutError) as e:
             last_err = e
             wait = 2 ** attempt
-            print(f"    API error ({e}); retrying in {wait}s...")
             time.sleep(wait)
     raise RuntimeError(f"Failed after {retries} retries: {last_err}")
 
@@ -125,38 +152,80 @@ def load_results(path):
 def run_for_model(client, model, questions):
     path = results_path(model)
     results = load_results(path)
+    total = len(questions) * len(CONDITIONS)
+
+    # Drop any previously-saved entry where we never actually got a parseable
+    # answer (e.g. a response that got cut off before reaching the answer
+    # line) -- treat those as not-done so they're retried instead of skipped
+    # forever.
+    n_before = len(results)
+    results = [r for r in results if r.get("extracted_answer") is not None]
+    n_dropped = n_before - len(results)
+    if n_dropped:
+        print(f"    dropping {n_dropped} previously-unparseable result(s) from {path}, will retry")
+
     done_keys = {(r["question_id"], r["condition"]) for r in results}
 
-    total = len(questions) * len(CONDITIONS)
-    count = len(done_keys)
     print(f"\n=== {model}  ->  {path} ===")
-    if count == total:
+    todo = [(q, cond) for q in questions for cond in CONDITIONS if (q["id"], cond) not in done_keys]
+    if not todo:
         print(f"    already complete ({total}/{total}), skipping")
         return
+    print(f"    {len(todo)} calls to make ({len(done_keys)}/{total} already done), concurrency={CONCURRENCY}")
 
-    for q in questions:
-        for condition in CONDITIONS:
-            key = (q["id"], condition)
-            if key in done_keys:
+    write_lock = threading.Lock()
+    stop_model = threading.Event()
+    completed_count = [len(done_keys)]  # mutable box so the closure below can update it
+
+    def worker(q, condition):
+        if stop_model.is_set():
+            return None
+        prompt = q[f"{condition}_prompt"]
+        return call_model(client, model, prompt)
+
+    with concurrent.futures.ThreadPoolExecutor(max_workers=CONCURRENCY) as executor:
+        future_to_item = {executor.submit(worker, q, cond): (q, cond) for q, cond in todo}
+        for future in concurrent.futures.as_completed(future_to_item):
+            q, condition = future_to_item[future]
+            try:
+                raw_text = future.result()
+            except FatalAuthError as e:
+                stop_model.set()
+                raise SystemExit(
+                    f"OpenRouter rejected the API key (401 authentication error): {e}\n"
+                    f"Double-check OPENROUTER_API_KEY is set to a valid OpenRouter key "
+                    f"(starts with 'sk-or-'), not a key from another provider."
+                )
+            except ModelNotFoundError as e:
+                if not stop_model.is_set():
+                    print(f"    Model '{model}' not found on OpenRouter (404) -- abandoning "
+                          f"remaining calls for it. Check https://openrouter.ai/models for the "
+                          f"current slug: {e}")
+                stop_model.set()
                 continue
-            prompt = q[f"{condition}_prompt"]
-            print(f"[{count + 1}/{total}] {q['id']} ({q['original_dataset']}) / {condition}")
-            raw_text = call_model(client, model, prompt)
-            if raw_text is None:
-                # model wasn't found on OpenRouter -- bail out of this model entirely
-                return
+            except Exception as e:
+                print(f"    FAILED {q['id']}/{condition}, giving up on this one: {e}")
+                continue
+
+            if raw_text is None:  # stop_model was already set before this one started
+                continue
+
             final_answer = extract_final_answer(raw_text)
             if final_answer is None:
-                print(f"    WARNING: could not find 'best answer is: (X)' in response")
-            results.append({
+                print(f"    WARNING: could not find 'best answer is: (X)' in response ({q['id']}/{condition})")
+            record = {
                 "question_id": q["id"],
                 "condition": condition,
                 "model": model,
                 "raw_response": raw_text,
                 "extracted_answer": final_answer,
-            })
-            count += 1
-            path.write_text(json.dumps(results, indent=2))
+            }
+            with write_lock:
+                results.append(record)
+                completed_count[0] += 1
+                path.write_text(json.dumps(results, indent=2))
+                n = completed_count[0]
+            print(f"[{n}/{total}] {q['id']} ({q['original_dataset']}) / {condition}")
 
     print(f"Done: {len(results)} results written to {path}")
 
@@ -181,7 +250,8 @@ def main():
     calls_per_model = len(questions) * len(CONDITIONS)
     print(f"Models to run: {models}")
     print(f"{calls_per_model} calls per model, {calls_per_model * len(models)} total "
-          f"(already-completed question/condition pairs are skipped, so a re-run costs less)")
+          f"(already-completed question/condition pairs are skipped, so a re-run costs less) "
+          f"-- concurrency={CONCURRENCY} per model")
 
     for model in models:
         run_for_model(client, model, questions)
