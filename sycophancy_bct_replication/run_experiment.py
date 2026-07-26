@@ -73,23 +73,22 @@ DEFAULT_MODELS = [
 ]
 
 QUESTIONS_PATH = Path("sampled_questions.json")
-MAX_TOKENS = 1500  # room for a full visible step-by-step CoT plus the final answer line
+# Some models (Gemini 2.5 Pro, Claude/GPT with extended thinking, etc.) spend
+# part of the token budget on a HIDDEN reasoning pass before writing any
+# visible text. Turns out some endpoints (Gemini 2.5 Pro among them) treat
+# that reasoning as MANDATORY and reject a request that tries to disable it
+# outright (400: "Reasoning is mandatory for this endpoint and cannot be
+# disabled") -- so instead of turning it off, we just cap it, which is
+# accepted whether reasoning is optional or mandatory for a given model.
+# Overall max_tokens has to comfortably exceed the reasoning cap, or there's
+# nothing left for the visible step-by-step CoT + final answer line.
+# See: https://openrouter.ai/docs/use-cases/reasoning-tokens
+REASONING_BUDGET = 1000
+MAX_TOKENS = 3000  # reasoning budget + plenty of room for the visible answer
 TEMPERATURE = 0
 CONDITIONS = ["unbiased", "biased"]
 CONCURRENCY = int(os.environ.get("CONCURRENCY", "8"))
-
-# Some models (Gemini 2.5 Pro, Claude with extended thinking, etc.) spend part
-# of max_tokens on a HIDDEN reasoning pass before writing any visible text --
-# with a low max_tokens that hidden pass can eat the whole budget, cutting the
-# response off before it ever reaches "the best answer is: (X)". We want the
-# step-by-step reasoning to happen in the VISIBLE completion anyway (the
-# dataset's own prompt already asks for that explicitly, and that's what
-# faithfully matches the paper's original GPT-3.5-Turbo methodology, which
-# had no separate hidden-thinking channel to begin with). This OpenRouter
-# extension turns hidden reasoning off; it's a no-op for models that don't
-# support it, so it's safe to send on every call. See:
-# https://openrouter.ai/docs/use-cases/reasoning-tokens
-REASONING_EXTRA_BODY = {"reasoning": {"effort": "none"}}
+REASONING_EXTRA_BODY = {"reasoning": {"max_tokens": REASONING_BUDGET}}
 
 # Matches the exact format the dataset's own prompts ask for:
 # 'Therefore, the best answer is: (X).'
@@ -102,6 +101,11 @@ class FatalAuthError(Exception):
 
 class ModelNotFoundError(Exception):
     """OpenRouter doesn't recognize this model slug -- skip the rest of this model."""
+
+
+class BadRequestFatalError(Exception):
+    """A malformed/rejected request (400) -- retrying the identical request
+    will just fail identically, so don't burn retries on it."""
 
 
 def model_slug(model):
@@ -136,6 +140,8 @@ def call_model(client, model, user_prompt, retries=4):
             raise FatalAuthError(str(e))
         except openai.NotFoundError as e:
             raise ModelNotFoundError(str(e))
+        except openai.BadRequestError as e:
+            raise BadRequestFatalError(str(e))
         except (openai.APIConnectionError, openai.RateLimitError, openai.InternalServerError, openai.APITimeoutError) as e:
             last_err = e
             wait = 2 ** attempt
@@ -201,6 +207,12 @@ def run_for_model(client, model, questions):
                     print(f"    Model '{model}' not found on OpenRouter (404) -- abandoning "
                           f"remaining calls for it. Check https://openrouter.ai/models for the "
                           f"current slug: {e}")
+                stop_model.set()
+                continue
+            except BadRequestFatalError as e:
+                if not stop_model.is_set():
+                    print(f"    '{model}' rejected our request shape (400) -- abandoning remaining "
+                          f"calls for it rather than retrying an identical failure: {e}")
                 stop_model.set()
                 continue
             except Exception as e:
