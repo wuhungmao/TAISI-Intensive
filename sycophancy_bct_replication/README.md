@@ -35,20 +35,36 @@ Every item has:
 
 ## Setup (5 min)
 
+Calls go through [OpenRouter](https://openrouter.ai) rather than any single
+provider's API directly — one key gets you both Claude and GPT models
+through the same OpenAI-compatible client, just by changing the model slug.
+
 ```bash
 pip install -r requirements.txt
-export ANTHROPIC_API_KEY=sk-...
+export OPENROUTER_API_KEY=sk-or-...
 ```
 
 ## 1. Run the experiment
 
 ```bash
-python run_experiment.py
+OPENROUTER_MODEL=anthropic/claude-sonnet-5 python run_experiment.py
 ```
 
 Sends both the unbiased and biased prompt for all 60 questions (120 calls
-total) and saves raw responses to `results_raw.json` as it goes — safe to
-Ctrl-C, re-running skips (question, condition) pairs you already have.
+total) and saves raw responses to `results_raw_<model>.json` as it goes —
+safe to Ctrl-C, re-running skips (question, condition) pairs you already
+have. Run it again with a different model and it writes to a separate file
+without touching the first one — e.g. to also sanity-check against the
+exact model the paper used:
+
+```bash
+OPENROUTER_MODEL=openai/gpt-3.5-turbo python run_experiment.py
+```
+
+(Model slugs on OpenRouter are `{provider}/{name}` — check
+[openrouter.ai/models](https://openrouter.ai/models) if a slug 404s; GPT-3.5-Turbo
+is on OpenAI's own deprecation path for October 2026, so it may eventually
+disappear.)
 
 ## 2. Grade and chart
 
@@ -56,26 +72,27 @@ Ctrl-C, re-running skips (question, condition) pairs you already have.
 python analyze.py
 ```
 
-Prints:
-- Overall accuracy and "biasing rate" (% of answers on the 52 non-control
-  questions that flip to match the suggested *wrong* answer) for the
-  unbiased vs. biased condition.
+This auto-discovers every `results_raw_*.json` file in the folder, so it
+works whether you ran one model or several. Prints:
+- Per model: overall accuracy and "biasing rate" (% of answers on the 52
+  non-control questions that flip to match the suggested *wrong* answer)
+  for the unbiased vs. biased condition.
 - The same breakdown split out by source dataset (MMLU / TruthfulQA /
   LogiQA / HellaSwag).
 - A flagged list of any response it couldn't parse an answer from.
 
-And saves `bct_replication_results.png` — a two-panel chart comparing your
-model's biasing rate and accuracy directly against the paper's published
-GPT-3.5-Turbo baseline (hardcoded from their Table 4 / Table 5: 12.5% →
-35.5% biasing rate, 61.7% → 48.0% accuracy, unbiased → biased). That
-hardcoded baseline is the one number in this repo you should double check
-against the actual paper before presenting — I pulled it from Table 4/5 via
-a summarization pass, not a manual read of the PDF.
+And saves `bct_replication_results.png` — a chart comparing every model you
+ran against the paper's published GPT-3.5-Turbo baseline (hardcoded from
+their Table 4 / Table 5: 12.5% → 35.5% biasing rate, 61.7% → 48.0% accuracy,
+unbiased → biased). That hardcoded baseline is the one number in this repo
+you should double check against the actual paper before presenting — I
+pulled it from Table 4/5 via a summarization pass, not a manual read of the
+PDF.
 
 ## What's actually interesting to say in your presentation
 
-- Does Claude's biasing-rate *jump* (unbiased → biased) look smaller than
-  GPT-3.5-Turbo's 23-point jump? That's the headline "did a newer/more
+- Does your model's biasing-rate *jump* (unbiased → biased) look smaller
+  than GPT-3.5-Turbo's 23-point jump? That's the headline "did a newer/more
   aligned model get more robust to this?" result.
 - Does the natural noise floor (biasing rate under the *unbiased* prompt —
   i.e., how often the model happens to pick that option with no nudge at
